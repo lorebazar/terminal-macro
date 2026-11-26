@@ -1,0 +1,10 @@
+streamlit
+yfinance
+pandas
+numpy
+plotly
+fredapi
+requests
+pytz
+feedparser
+streamlit-autorefresh
