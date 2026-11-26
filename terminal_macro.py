@@ -544,4 +544,159 @@ edited = stretch(
     key=f"levels_editor_{version}",
     column_config={
         "Actif": st.column_config.SelectboxColumn(options=[EUR, GOLD]),
-        "Type": st
+        "Type": st.column_config.SelectboxColumn(options=["Support", "Résistance", "Pivot"]),
+        "Niveau": st.column_config.NumberColumn(format="%.4f"),
+    },
+)
+if st.button("💾 Enregistrer les niveaux"):
+    st.session_state["levels"] = clean_levels(edited.dropna())
+    st.session_state["levels_version"] = version + 1
+    try:
+        with open(LEVELS_FILE, "w", encoding="utf-8") as f:
+            json.dump(st.session_state["levels"].to_dict("records"), f, ensure_ascii=False)
+        st.session_state["levels_msg"] = "Niveaux enregistrés."
+    except OSError:
+        st.session_state["levels_msg"] = (
+            "Enregistrement fichier impossible : niveaux gardés en session."
+        )
+    st.rerun()
+if "levels_msg" in st.session_state:
+    st.info(st.session_state.pop("levels_msg"))
+
+auto = []
+for name in (EUR, GOLD):
+    d = daily.get(name)
+    if d is None or len(d) < 3:
+        continue
+    finished = d.index[-1].date() < now_utc.date() or forex_closed(now_utc)
+    done = d.iloc[-1] if finished else d.iloc[-2]
+    h_, l_, c_ = float(done["High"]), float(done["Low"]), float(done["Close"])
+    p = (h_ + l_ + c_) / 3
+    auto += [
+        (name, "Pivot", p),
+        (name, "Résistance", 2 * p - l_),
+        (name, "Support", 2 * p - h_),
+        (name, "Résistance", p + (h_ - l_)),
+        (name, "Support", p - (h_ - l_)),
+    ]
+
+all_levels = [(r.Actif, r.Type, r.Niveau, "Perso")
+              for r in st.session_state["levels"].dropna().itertuples()]
+all_levels += [(a_, t_, n_, "Auto") for a_, t_, n_ in auto]
+out = []
+for actif, typ, niveau, source in all_levels:
+    pr, a = price(actif), atr(actif)
+    if pr is None:
+        continue
+    niveau = float(niveau)
+    dist = pr - niveau
+    out.append({
+        "Actif": actif, "Type": typ, "Source": source,
+        "Niveau": round(niveau, 4), "Prix": round(pr, 4),
+        "Écart %": round(dist / pr * 100, 2),
+        "Écart (ATR)": round(dist / a, 2) if a else None,
+    })
+    if a and abs(dist) < 0.25 * a:
+        txt = f"🎯 {actif} proche du niveau {typ} {niveau:.4f} (prix {pr:.4f})"
+        st.warning(txt)
+        notify(f"lvl|{actif}|{typ}|{niveau:.4f}|{now_local.date()}", txt)
+if out:
+    stretch(st.dataframe, pd.DataFrame(out).sort_values(["Actif", "Niveau"]), hide_index=True)
+
+SCEN = {
+    "Inflation US plus faible que prévu": (
+        "EUR/USD haussier", "Or haussier",
+        "Baisse des taux réels et du dollar.",
+        "Rebond des taux réels / DXY au-dessus de sa MM20."),
+    "Fed plus ferme (hawkish)": (
+        "EUR/USD baissier", "Or baissier",
+        "Hausse des taux réels et du dollar.",
+        "Reprise rapide des anticipations de baisse de taux."),
+    "BCE plus ferme / Fed plus souple": (
+        "EUR/USD haussier", "Or neutre à haussier",
+        "L'écart de taux se resserre en faveur de l'euro.",
+        "Données européennes décevantes."),
+    "Chute tech / aversion au risque": (
+        "EUR/USD baissier (dollar refuge)", "Or haussier",
+        "Fuite vers les valeurs refuges ; le dollar peut monter en même temps que l'or.",
+        "Rebond du VIX bref puis retour au calme."),
+    "Choc géopolitique": (
+        "EUR/USD légèrement baissier", "Or haussier",
+        "Demande de refuge et prime de risque.",
+        "Désescalade rapide."),
+    "Stress budgétaire France (spread OAT-Bund en hausse)": (
+        "EUR/USD baissier", "Or neutre",
+        "Prime de risque sur l'euro.",
+        "Spread qui se resserre / intervention BCE."),
+}
+choice = st.selectbox("Scénario qui se réalise :", list(SCEN))
+eur_b, gold_b, why, inval = SCEN[choice]
+st.success(f"**{eur_b}** • **{gold_b}**\n\nPourquoi : {why}\n\nInvalidation : {inval}")
+st.caption("Hypothèses pédagogiques à confirmer par le prix, pas des signaux automatiques.")
+
+# ------------------------------------------------------------------ 6. plan d'exécution
+st.subheader("6. 🛠️ Plan d'exécution (ATR)")
+p1, p2, p3, p4 = st.columns(4)
+asset = p1.selectbox("Actif", [EUR, GOLD])
+capital = p2.number_input("Capital ($)", min_value=100.0, value=10000.0, step=500.0)
+risk_pct = p3.number_input("Risque par trade (%)", min_value=0.1, max_value=5.0,
+                           value=1.0, step=0.1)
+mult = p4.number_input("Stop (× ATR)", min_value=0.5, max_value=5.0, value=1.5, step=0.1)
+sc_a = scores.get(asset)
+default_dir = 0 if (sc_a or 0) >= 0 else 1
+direction = st.radio("Direction", ["Achat", "Vente"], index=default_dir, horizontal=True)
+if sc_a is None or abs(sc_a) < 0.5:
+    st.info("Biais macro neutre ou indisponible : privilégier l'attente d'une confirmation.")
+elif (sc_a > 0) != (direction == "Achat"):
+    st.warning("La direction choisie va à l'encontre du biais macro.")
+pr, a = price(asset), atr(asset)
+if pr and a:
+    sgn = 1 if direction == "Achat" else -1
+    stop_dist = mult * a
+    risk_usd = capital * risk_pct / 100
+    if asset == EUR:
+        lots = risk_usd / (stop_dist / 0.0001 * 10)
+        unit = "10 $/pip/lot"
+    else:
+        lots = risk_usd / (stop_dist * 100)
+        unit = "100 oz/lot, futures GC"
+    stretch(st.dataframe, pd.DataFrame([
+        {"Niveau": "Entrée", "Prix": round(pr, 4)},
+        {"Niveau": "Stop", "Prix": round(pr - sgn * stop_dist, 4)},
+        {"Niveau": "Objectif 1 (R:R 1,5)", "Prix": round(pr + sgn * 1.5 * stop_dist, 4)},
+        {"Niveau": "Objectif 2 (R:R 2,5)", "Prix": round(pr + sgn * 2.5 * stop_dist, 4)},
+    ]), hide_index=True)
+    st.caption(f"ATR(14) journalier = {a:.4f} • risque = {risk_usd:,.0f} $ • "
+               f"taille indicative ≈ {lots:.2f} lot ({unit}). À adapter à ton courtier.")
+else:
+    st.caption("ATR indisponible.")
+st.divider()
+
+# ------------------------------------------------------------------ 7. actualités
+st.subheader("7. 📰 Market Briefing (flux en direct)")
+only_rel = st.checkbox("Filtrer sur les mots-clés Or / EUR / USD / Fed / BCE", value=True)
+shown = 0
+for it in news:
+    if only_rel and not any(k in it["title"].lower() for k in KEYWORDS):
+        continue
+    when = it["dt"].astimezone(tz_local).strftime("%d/%m %H:%M") if it["dt"] else "--"
+    st.markdown(f"**{when} WAT** · _{it['src']}_ — [{it['title']}]({it['link']})")
+    shown += 1
+    if shown >= 12:
+        break
+if shown == 0:
+    st.caption("Aucune dépêche à afficher.")
+ok_feeds = [k for k, v in news_status.items() if v]
+health["Actualités"] = (
+    "🟢" if len(ok_feeds) == len(FEEDS) else "🟠" if ok_feeds else "🔴",
+    f"{len(ok_feeds)}/{len(FEEDS)} flux",
+)
+st.caption("⚠️ Outil d'aide à la décision, pas un conseil financier. Données yfinance : "
+           "non officielles, parfois retardées. Vérifie toujours le prix sur ta plateforme.")
+
+# ------------------------------------------------------------------ voyants (barre latérale)
+with health_box:
+    st.header("📡 État des flux")
+    for k, (icon, detail) in health.items():
+        st.write(f"{icon} **{k}** — {detail}")
+    st.caption(f"Dernière exécution : {now_local:%H:%M:%S} WAT")
